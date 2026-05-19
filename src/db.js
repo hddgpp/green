@@ -29,6 +29,13 @@ if (!useMemory) {
       ? false
       : { rejectUnauthorized: false },
   });
+
+  // Every new connection in the pool runs `SET search_path = greenzone`.
+  // This means all unqualified table names (bets, users, etc.) resolve
+  // to the greenzone schema. Other apps using `public` are unaffected.
+  pool.on('connect', (client) => {
+    client.query('SET search_path TO greenzone, public');
+  });
 }
 
 export async function initDb() {
