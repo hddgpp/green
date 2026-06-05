@@ -1,7 +1,7 @@
 // db.js — Database layer.
 // Postgres in production (DATABASE_URL set); in-memory fallback otherwise.
 //
-// Tables: bets, users, refresh_tokens, password_resets
+// Tables: bets, users, refresh_tokens, password_resets, visits
 // All schema is created in initDb() with idempotent CREATE TABLE IF NOT EXISTS.
 
 import pg from 'pg';
@@ -18,6 +18,8 @@ const memory = {
   refreshIdSeq: 1,
   passwordResets: [], // { id, userId, tokenHash, expiresAt, usedAt, createdAt }
   resetIdSeq: 1,
+  visits: [], // { id, visitorId, ipDisplay, country, city, path, referrer, createdAt }
+  visitIdSeq: 1,
 };
 
 const useMemory = !process.env.DATABASE_URL;
@@ -93,6 +95,25 @@ export async function initDb() {
     );
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS password_resets_user_id_idx ON password_resets (user_id);`);
+
+  // visits — website traffic analytics. ip_display holds a TRUNCATED ip by default
+  // (see middleware/visitTracker.js). visitor_id is a salted daily hash used to
+  // count unique visitors without a durable fingerprint.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS visits (
+      id          SERIAL PRIMARY KEY,
+      visitor_id  TEXT NOT NULL,
+      ip_display  TEXT,
+      country     TEXT,
+      city        TEXT,
+      path        TEXT,
+      referrer    TEXT,
+      created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS visits_created_at_idx ON visits (created_at DESC);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS visits_visitor_id_idx ON visits (visitor_id);`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS visits_country_idx ON visits (country);`);
 
   console.log('[db] Postgres ready.');
 }
@@ -450,4 +471,232 @@ export async function markPasswordResetUsed(id) {
     [id]
   );
   return rowCount > 0;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// VISITS (analytics)
+// ───────────────────────────────────────────────────────────────────
+
+// Insert one visit. Called by the public /api/track beacon.
+export async function recordVisit({ visitorId, ipDisplay, country, city, path, referrer }) {
+  if (useMemory) {
+    const row = {
+      id: memory.visitIdSeq++,
+      visitorId,
+      ipDisplay: ipDisplay || null,
+      country: country || null,
+      city: city || null,
+      path: path || null,
+      referrer: referrer || null,
+      createdAt: new Date().toISOString(),
+    };
+    memory.visits.push(row);
+    return row;
+  }
+  const { rows } = await pool.query(
+    `INSERT INTO visits (visitor_id, ip_display, country, city, path, referrer)
+     VALUES ($1, $2, $3, $4, $5, $6)
+     RETURNING id, visitor_id AS "visitorId", ip_display AS "ipDisplay",
+               country, city, path, referrer, created_at AS "createdAt"`,
+    [visitorId, ipDisplay || null, country || null, city || null, path || null, referrer || null]
+  );
+  return rows[0];
+}
+
+// Summary cards: unique visitors today / this month / this year / all-time.
+// "Unique" = distinct visitor_id within each window. Boundaries are UTC.
+export async function getVisitSummary() {
+  if (useMemory) {
+    const now = new Date();
+    const startOfDay = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+    const startOfMonth = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const startOfYear = new Date(Date.UTC(now.getUTCFullYear(), 0, 1));
+
+    const uniqIn = (from) => {
+      const set = new Set();
+      for (const v of memory.visits) {
+        if (new Date(v.createdAt) >= from) set.add(v.visitorId);
+      }
+      return set.size;
+    };
+    const allTime = new Set(memory.visits.map((v) => v.visitorId)).size;
+
+    return {
+      today: uniqIn(startOfDay),
+      month: uniqIn(startOfMonth),
+      year: uniqIn(startOfYear),
+      total: allTime,
+    };
+  }
+  const { rows } = await pool.query(
+    `SELECT
+       COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= date_trunc('day', NOW()))::int   AS today,
+       COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= date_trunc('month', NOW()))::int AS month,
+       COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= date_trunc('year', NOW()))::int  AS year,
+       COUNT(DISTINCT visitor_id)::int                                                          AS total
+     FROM visits`
+  );
+  return rows[0];
+}
+
+// Time series for the chart. interval ∈ 'day' | 'week' | 'month' | 'year'.
+// Returns [{ bucket: ISO string, visits: number, uniques: number }] oldest→newest.
+// `points` caps how many buckets back we look (default sized per interval).
+export async function getVisitTimeSeries({ interval = 'day', points } = {}) {
+  const allowed = { day: 30, week: 12, month: 12, year: 5 };
+  const trunc = allowed[interval] ? interval : 'day';
+  const limit = Math.min(366, Math.max(1, Number(points) || allowed[trunc]));
+
+  if (useMemory) {
+    // Bucket in JS to mirror date_trunc semantics (UTC).
+    const buckets = new Map(); // key: ISO bucket start → { visits, uniques:Set }
+    const bucketStart = (d) => {
+      const dt = new Date(d);
+      const y = dt.getUTCFullYear();
+      const m = dt.getUTCMonth();
+      const day = dt.getUTCDate();
+      if (trunc === 'year') return new Date(Date.UTC(y, 0, 1));
+      if (trunc === 'month') return new Date(Date.UTC(y, m, 1));
+      if (trunc === 'week') {
+        const dow = (dt.getUTCDay() + 6) % 7; // Monday=0
+        const monday = new Date(Date.UTC(y, m, day - dow));
+        return monday;
+      }
+      return new Date(Date.UTC(y, m, day)); // day
+    };
+    for (const v of memory.visits) {
+      const key = bucketStart(v.createdAt).toISOString();
+      if (!buckets.has(key)) buckets.set(key, { visits: 0, uniques: new Set() });
+      const b = buckets.get(key);
+      b.visits += 1;
+      b.uniques.add(v.visitorId);
+    }
+    const series = [...buckets.entries()]
+      .map(([bucket, b]) => ({ bucket, visits: b.visits, uniques: b.uniques.size }))
+      .sort((a, b) => new Date(a.bucket) - new Date(b.bucket));
+    return series.slice(-limit);
+  }
+
+  // Postgres path. date_trunc gives clean period buckets; we generate a gap-free
+  // series so the chart doesn't have holes on quiet days.
+  const intervalStep = { day: '1 day', week: '1 week', month: '1 month', year: '1 year' }[trunc];
+  const { rows } = await pool.query(
+    `WITH series AS (
+       SELECT generate_series(
+         date_trunc($1, NOW()) - ($2::int - 1) * $3::interval,
+         date_trunc($1, NOW()),
+         $3::interval
+       ) AS bucket
+     )
+     SELECT s.bucket AS "bucket",
+            COALESCE(COUNT(v.id), 0)::int AS visits,
+            COALESCE(COUNT(DISTINCT v.visitor_id), 0)::int AS uniques
+     FROM series s
+     LEFT JOIN visits v
+       ON date_trunc($1, v.created_at) = s.bucket
+     GROUP BY s.bucket
+     ORDER BY s.bucket ASC`,
+    [trunc, limit, intervalStep]
+  );
+  return rows;
+}
+
+// Visitors table: one row per visitor_id, aggregated. Newest activity first by default.
+// filters: { search?, page, limit, sort?: 'recent'|'visits', dir?: 'asc'|'desc' }
+// search matches ip_display, country, city (case-insensitive substring).
+export async function listVisitorsPaginated({ search = '', page = 1, limit = 25, sort = 'recent', dir = 'desc' } = {}) {
+  const safePage = Math.max(1, Number(page) || 1);
+  const safeLimit = Math.min(100, Math.max(1, Number(limit) || 25));
+  const offset = (safePage - 1) * safeLimit;
+  const sortKey = sort === 'visits' ? 'visits' : 'lastVisit';
+  const sortDir = dir === 'asc' ? 'asc' : 'desc';
+
+  if (useMemory) {
+    const byVisitor = new Map();
+    for (const v of memory.visits) {
+      if (!byVisitor.has(v.visitorId)) {
+        byVisitor.set(v.visitorId, {
+          visitorId: v.visitorId,
+          ipDisplay: v.ipDisplay,
+          country: v.country,
+          city: v.city,
+          visits: 0,
+          lastVisit: v.createdAt,
+        });
+      }
+      const agg = byVisitor.get(v.visitorId);
+      agg.visits += 1;
+      if (new Date(v.createdAt) >= new Date(agg.lastVisit)) {
+        agg.lastVisit = v.createdAt;
+        agg.ipDisplay = v.ipDisplay;
+        agg.country = v.country;
+        agg.city = v.city;
+      }
+    }
+    let rows = [...byVisitor.values()];
+    if (search) {
+      const q = search.toLowerCase();
+      rows = rows.filter((r) =>
+        [r.ipDisplay, r.country, r.city].filter(Boolean).some((x) => String(x).toLowerCase().includes(q))
+      );
+    }
+    const total = rows.length;
+    rows.sort((a, b) => {
+      let cmp;
+      if (sortKey === 'visits') cmp = a.visits - b.visits;
+      else cmp = new Date(a.lastVisit) - new Date(b.lastVisit);
+      return sortDir === 'asc' ? cmp : -cmp;
+    });
+    return { rows: rows.slice(offset, offset + safeLimit), total, page: safePage, limit: safeLimit };
+  }
+
+  const params = [];
+  let whereSql = '';
+  if (search) {
+    params.push(`%${search}%`);
+    const p = `$${params.length}`;
+    whereSql = `WHERE (ip_display ILIKE ${p} OR country ILIKE ${p} OR city ILIKE ${p})`;
+  }
+
+  const totalRes = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM (
+       SELECT visitor_id FROM visits ${whereSql} GROUP BY visitor_id
+     ) t`,
+    params
+  );
+  const total = totalRes.rows[0].total;
+
+  const orderCol = sortKey === 'visits' ? 'visits' : '"lastVisit"';
+  params.push(safeLimit, offset);
+  const dataRes = await pool.query(
+    `SELECT visitor_id AS "visitorId",
+            (ARRAY_AGG(ip_display ORDER BY created_at DESC))[1] AS "ipDisplay",
+            (ARRAY_AGG(country    ORDER BY created_at DESC))[1] AS country,
+            (ARRAY_AGG(city       ORDER BY created_at DESC))[1] AS city,
+            COUNT(*)::int      AS visits,
+            MAX(created_at)    AS "lastVisit"
+     FROM visits ${whereSql}
+     GROUP BY visitor_id
+     ORDER BY ${orderCol} ${sortDir}
+     LIMIT $${params.length - 1} OFFSET $${params.length}`,
+    params
+  );
+  return { rows: dataRes.rows, total, page: safePage, limit: safeLimit };
+}
+
+// Optional retention cleanup — delete visits older than N days. Not called
+// automatically; wire to a cron/scheduled job if you want enforced retention.
+export async function deleteVisitsOlderThan(days) {
+  const n = Math.max(1, Number(days) || 90);
+  if (useMemory) {
+    const cutoff = Date.now() - n * 24 * 60 * 60 * 1000;
+    const before = memory.visits.length;
+    memory.visits = memory.visits.filter((v) => new Date(v.createdAt).getTime() >= cutoff);
+    return before - memory.visits.length;
+  }
+  const { rowCount } = await pool.query(
+    `DELETE FROM visits WHERE created_at < NOW() - ($1::int * INTERVAL '1 day')`,
+    [n]
+  );
+  return rowCount;
 }

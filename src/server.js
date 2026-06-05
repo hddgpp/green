@@ -6,6 +6,7 @@
 //   /api/bets/stats              GET   public (totals)
 //   /api/bets                    POST  X-Admin-Token (extension)
 //   /api/bets/:id                DEL   X-Admin-Token (extension)
+//   /api/track                   POST  public + rate-limited (visit beacon)
 //   /api/auth/signup             POST  public + rate-limited
 //   /api/auth/login              POST  public + rate-limited
 //   /api/auth/logout             POST  public
@@ -15,6 +16,9 @@
 //   /api/auth/reset-password     POST  public + rate-limited
 //   /api/admin/stats             GET   admin JWT
 //   /api/admin/users             GET   admin JWT
+//   /api/admin/analytics/summary     GET admin JWT
+//   /api/admin/analytics/timeseries  GET admin JWT
+//   /api/admin/analytics/visitors    GET admin JWT
 
 import 'dotenv/config';
 import express from 'express';
@@ -23,11 +27,12 @@ import cookieParser from 'cookie-parser';
 import helmet from 'helmet';
 
 import { initDb } from './db.js';
-import { generalLimiter } from './middleware/rateLimiters.js';
+import { generalLimiter, trackLimiter } from './middleware/rateLimiters.js';
 
 import authRoutes from './routes/auth.js';
 import betsRoutes from './routes/bets.js';
 import adminRoutes from './routes/admin.js';
+import trackRoutes from './routes/track.js';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -82,6 +87,7 @@ app.get('/api/health', (_req, res) => {
   res.json({ ok: true, service: 'greenzone-api', time: new Date().toISOString() });
 });
 
+app.use('/api/track', trackLimiter, trackRoutes);
 app.use('/api/auth', authRoutes);
 app.use('/api/bets', betsRoutes);
 app.use('/api/admin', adminRoutes);
